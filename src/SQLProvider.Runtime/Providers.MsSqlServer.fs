@@ -496,6 +496,16 @@ type internal MSSQLPagingCompatibility =
 
 type internal MSSqlServerProvider(contextSchemaPath, tableNames:string) =
     let schemaCache = SchemaCache.LoadOrEmpty(contextSchemaPath)
+
+    let isSynapse (con:IDbConnection) =
+        // Try to detect Synapse by server version or product name
+        try
+            let conn = con :?> System.Data.SqlClient.SqlConnection
+            let product = conn.DataSource.ToLower()
+            let version = conn.ServerVersion
+            // Synapse usually has 'dw' or 'synapse' in DataSource, or version starts with '12.'
+            product.Contains("synapse") || product.Contains("dw")
+        with _ -> false
     let createInsertCommand = MSSqlServer.createInsertCommand schemaCache
     let createUpdateCommand = MSSqlServer.createUpdateCommand schemaCache
     let createDeleteCommand = MSSqlServer.createDeleteCommand schemaCache
@@ -595,25 +605,46 @@ type internal MSSqlServerProvider(contextSchemaPath, tableNames:string) =
                // note this data can be obtained using con.GetSchema, and i didn't know at the time about the restrictions you can
                // pass in to filter by table name etc - we should probably swap this code to use that instead at some point
                // but hey, this works
-               let baseQuery = @"SELECT c.COLUMN_NAME,c.DATA_TYPE, c.character_maximum_length, c.numeric_precision, c.is_nullable
-                                              ,CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 'PRIMARY KEY' ELSE '' END AS KeyType
-                                              ,COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') AS IsIdentity, 
-                                              case when COLUMN_DEFAULT is not null then 1 else 0 end as HasDefault,
-                                              COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA+'.'+c.TABLE_NAME), c.COLUMN_NAME, 'IsComputed') AS IsComputed
-                                 FROM INFORMATION_SCHEMA.COLUMNS c
-                                 LEFT JOIN (
-                                             SELECT ku.TABLE_CATALOG,ku.TABLE_SCHEMA,ku.TABLE_NAME,ku.COLUMN_NAME
-                                             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
-                                             INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS ku
-                                                 ON tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
-                                                 AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
-                                          )   pk
-                                 ON  c.TABLE_CATALOG = pk.TABLE_CATALOG
-                                             AND c.TABLE_SCHEMA = pk.TABLE_SCHEMA
-                                             AND c.TABLE_NAME = pk.TABLE_NAME
-                                             AND c.COLUMN_NAME = pk.COLUMN_NAME
-                                 WHERE c.TABLE_SCHEMA = @schema AND c.TABLE_NAME = @table
-                                 ORDER BY c.TABLE_SCHEMA,c.TABLE_NAME, c.ORDINAL_POSITION"
+               let isSyn = isSynapse con
+               let baseQuery, paramCount =
+                   if isSyn then
+                       (@"SELECT c.COLUMN_NAME, c.DATA_TYPE, c.character_maximum_length, c.numeric_precision, c.is_nullable
+                            ,CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 'PRIMARY KEY' ELSE '' END AS KeyType
+                            ,case when COLUMN_DEFAULT is not null then 1 else 0 end as HasDefault
+                        FROM INFORMATION_SCHEMA.COLUMNS c
+                        LEFT JOIN (
+                            SELECT ku.TABLE_CATALOG,ku.TABLE_SCHEMA,ku.TABLE_NAME,ku.COLUMN_NAME
+                            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+                            INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS ku
+                                ON tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                                AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
+                        ) pk
+                        ON  c.TABLE_CATALOG = pk.TABLE_CATALOG
+                            AND c.TABLE_SCHEMA = pk.TABLE_SCHEMA
+                            AND c.TABLE_NAME = pk.TABLE_NAME
+                            AND c.COLUMN_NAME = pk.COLUMN_NAME
+                        WHERE c.TABLE_SCHEMA = @schema AND c.TABLE_NAME = @table
+                        ORDER BY c.TABLE_SCHEMA,c.TABLE_NAME, c.ORDINAL_POSITION", 7)
+                   else
+                       (@"SELECT c.COLUMN_NAME,c.DATA_TYPE, c.character_maximum_length, c.numeric_precision, c.is_nullable
+                            ,CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 'PRIMARY KEY' ELSE '' END AS KeyType
+                            ,COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') AS IsIdentity, 
+                            case when COLUMN_DEFAULT is not null then 1 else 0 end as HasDefault,
+                            COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA+'.'+c.TABLE_NAME), c.COLUMN_NAME, 'IsComputed') AS IsComputed
+                        FROM INFORMATION_SCHEMA.COLUMNS c
+                        LEFT JOIN (
+                            SELECT ku.TABLE_CATALOG,ku.TABLE_SCHEMA,ku.TABLE_NAME,ku.COLUMN_NAME
+                            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+                            INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS ku
+                                ON tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                                AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
+                        ) pk
+                        ON  c.TABLE_CATALOG = pk.TABLE_CATALOG
+                            AND c.TABLE_SCHEMA = pk.TABLE_SCHEMA
+                            AND c.TABLE_NAME = pk.TABLE_NAME
+                            AND c.COLUMN_NAME = pk.COLUMN_NAME
+                        WHERE c.TABLE_SCHEMA = @schema AND c.TABLE_NAME = @table
+                        ORDER BY c.TABLE_SCHEMA,c.TABLE_NAME, c.ORDINAL_POSITION", 9)
                use com = new SqlCommand(baseQuery,con:?>SqlConnection)
                com.Parameters.AddWithValue("@schema",table.Schema) |> ignore
                com.Parameters.AddWithValue("@table",table.Name) |> ignore
@@ -633,9 +664,9 @@ type internal MSSqlServerProvider(contextSchemaPath, tableNames:string) =
                                TypeMapping = m
                                IsNullable = let b = reader.GetString(4) in if b = "YES" then true else false
                                IsPrimaryKey = if reader.GetSqlString(5).Value = "PRIMARY KEY" then true else false
-                               IsAutonumber = reader.GetInt32(6) = 1
-                               HasDefault = reader.GetInt32(7) = 1
-                               IsComputed = reader.GetInt32(8) = 1
+                               IsAutonumber = if isSyn then false else reader.GetInt32(6) = 1
+                               HasDefault = if isSyn then reader.GetInt32(6) = 1 else reader.GetInt32(7) = 1
+                               IsComputed = if isSyn then false else reader.GetInt32(8) = 1
                                TypeInfo = if maxlen > 0 then ValueSome (dt + "(" + maxlen.ToString() + ")") else ValueSome dt }
                            if col.IsPrimaryKey then
                                schemaCache.PrimaryKeys.AddOrUpdate(table.FullName, [col.Name], fun key old -> 
