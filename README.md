@@ -86,3 +86,9 @@ The default maintainer account for projects under "fsprojects" is [@fsprojectsgi
 
 
 Depending on the used provider, the namespace of the SqlDataProvider type class varies as above.
+
+### TEST ONLY SYNAPSE REMOVE before merge
+
+```
+paket pack output bin template-file src/SQLProvider.MsSql.Runtime/SQLProviderSynapseTest.paket.template
+```
